@@ -1,0 +1,9 @@
+# Phase 1 — Local-First Memory Engine
+# Requires Python 3.11+
+
+numpy>=1.26.0
+jellyfish>=1.0.0
+sqlite-vec>=0.1.6
+
+# Optional: real local LLM inference (omit for mock-only runs)
+# llama-cpp-python>=0.2.90
