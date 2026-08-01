@@ -10,7 +10,7 @@ from typing import Any, Optional, Sequence
 import numpy as np
 
 from memory_engine.db import MemoryDB
-from memory_engine.extraction import hashing_embed
+from memory_engine.extraction import hashing_embed, get_local_embedder
 
 # Spec defaults
 RRF_K = 60
@@ -99,13 +99,21 @@ class HybridRetriever:
         lam: float = DEFAULT_LAMBDA,
         rrf_k: int = RRF_K,
         embed_fn: Optional[Any] = None,
+        use_fastembed: bool = True,
     ) -> None:
         self.db = db
         self.lam = lam
         self.rrf_k = rrf_k
-        self.embed_fn = embed_fn or (
-            lambda text: hashing_embed(text, db.dim)
-        )
+        if embed_fn is not None:
+            self.embed_fn = embed_fn
+        elif use_fastembed:
+            try:
+                embedder = get_local_embedder()
+                self.embed_fn = lambda text: embedder.embed(text, db.dim)
+            except Exception:
+                self.embed_fn = lambda text: hashing_embed(text, db.dim)
+        else:
+            self.embed_fn = lambda text: hashing_embed(text, db.dim)
 
     def retrieve(
         self,

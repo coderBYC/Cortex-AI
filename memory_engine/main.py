@@ -4,7 +4,8 @@ Runnable Phase 1 demonstration of the local-first memory engine.
 
 Usage:
     python -m memory_engine.main
-    python -m memory_engine.main --db /tmp/demo_memories.db
+    python -m memory_engine.main --db ./demo_memories.db --keep
+    python -m memory_engine.main --model ~/models/llama-3.2-3b-instruct.Q4_K_M.gguf
 """
 
 from __future__ import annotations
@@ -20,7 +21,8 @@ from memory_engine.extraction import (
     JARO_WINKLER_THRESHOLD,
     MEMORY_JSON_GBNF,
     MemoryExtractor,
-    MockLLM,
+    create_llm,
+    get_local_embedder,
     jaro_winkler,
 )
 from memory_engine.retrieval import DEFAULT_LAMBDA, HybridRetriever
@@ -48,19 +50,46 @@ def banner(title: str) -> None:
     print(f"\n{'=' * 60}\n  {title}\n{'=' * 60}")
 
 
-def run_demo(db_path: Path, *, keep_db: bool = False) -> int:
+def run_demo(
+    db_path: Path,
+    *,
+    keep_db: bool = False,
+    model_path: Path | None = None,
+    no_fastembed: bool = False,
+) -> int:
     banner("Local-First Memory Engine — Phase 1 Demo")
     print(f"DB path          : {db_path}")
     print(f"JW threshold     : {JARO_WINKLER_THRESHOLD}")
     print(f"Decay λ (hrs)    : {DEFAULT_LAMBDA}")
     print(f"GBNF grammar     : {len(MEMORY_JSON_GBNF)} chars (JSON-constrained)")
 
-    with MemoryDB(db_path) as db:
+    embedder = None
+    if not no_fastembed:
+        try:
+            embedder = get_local_embedder()
+            print(f"embeddings       : fastembed ({embedder.model_name}, dim={embedder.dim})")
+        except Exception as exc:
+            print(f"embeddings       : hashing fallback ({exc})")
+    else:
+        print("embeddings       : hashing fallback (--no-fastembed)")
+
+    llm = create_llm(model_path)
+    llm_name = type(llm).__name__
+    print(f"extractor LLM    : {llm_name}"
+          + (f" ({model_path})" if model_path else ""))
+
+    db_dim = embedder.dim if embedder is not None else 384
+    with MemoryDB(db_path, dim=db_dim) as db:
         print(f"sqlite-vec       : {'enabled' if db.vec_enabled else 'numpy fallback'}")
 
-        llm = MockLLM()
-        extractor = MemoryExtractor(db, llm)
-        retriever = HybridRetriever(db)
+        extractor = MemoryExtractor(
+            db, llm, embedder=embedder, use_fastembed=not no_fastembed
+        )
+        retriever = HybridRetriever(
+            db,
+            embed_fn=(lambda t: embedder.embed(t, db.dim)) if embedder else None,
+            use_fastembed=not no_fastembed and embedder is None,
+        )
 
         # --- Ingestion -------------------------------------------------------
         banner("1. Deduplicating Ingestion")
@@ -73,7 +102,6 @@ def run_demo(db_path: Path, *, keep_db: bool = False) -> int:
                       f"{a['entity']}.{a['attribute']} = {a['value']}"
                       + (f"  (sim={a['similarity']:.3f})" if "similarity" in a else ""))
 
-        # Show that Bryan ≈ Brian was merged via Jaro-Winkler
         sim = jaro_winkler("Bryan", "Brian")
         print(f"\n  Jaro-Winkler('Bryan','Brian') = {sim:.4f} "
               f"(threshold {JARO_WINKLER_THRESHOLD} → "
@@ -109,7 +137,6 @@ def run_demo(db_path: Path, *, keep_db: bool = False) -> int:
 
     if not keep_db and db_path.exists() and str(db_path).startswith(tempfile.gettempdir()):
         db_path.unlink(missing_ok=True)
-        # sqlite WAL sidecars
         Path(str(db_path) + "-wal").unlink(missing_ok=True)
         Path(str(db_path) + "-shm").unlink(missing_ok=True)
 
@@ -130,6 +157,18 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Keep the DB file after the demo finishes",
     )
+    parser.add_argument(
+        "--model",
+        type=Path,
+        default=None,
+        help="Path to a local GGUF model for GBNF JSON extraction "
+             "(or set CORTEX_MODEL). Default: MockLLM.",
+    )
+    parser.add_argument(
+        "--no-fastembed",
+        action="store_true",
+        help="Disable fastembed and use hashing-trick vectors",
+    )
     args = parser.parse_args(argv)
 
     if args.db is None:
@@ -141,7 +180,12 @@ def main(argv: list[str] | None = None) -> int:
         db_path = args.db
         keep = True
 
-    return run_demo(db_path, keep_db=keep)
+    return run_demo(
+        db_path,
+        keep_db=keep,
+        model_path=args.model,
+        no_fastembed=args.no_fastembed,
+    )
 
 
 if __name__ == "__main__":

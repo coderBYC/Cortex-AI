@@ -5,5 +5,8 @@ numpy>=1.26.0
 jellyfish>=1.0.0
 sqlite-vec>=0.1.6
 
-# Optional: real local LLM inference (omit for mock-only runs)
-# llama-cpp-python>=0.2.90
+# Real local embeddings (ONNX / MiniLM-class — replaces hashing-trick vectors)
+fastembed>=0.4.0
+
+# Local LLM JSON extraction with GBNF grammars
+llama-cpp-python>=0.2.90

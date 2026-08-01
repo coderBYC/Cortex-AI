@@ -1,43 +1,66 @@
-"""GBNF grammar definitions, local LLM extraction, and Jaro-Winkler deduplication."""
+"""GBNF grammar, local llama.cpp extraction, real embeddings, Jaro-Winkler dedup."""
 
 from __future__ import annotations
 
 import json
+import os
 import re
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Optional, Protocol, Sequence
 
 import jellyfish
 import numpy as np
 
-from memory_engine.db import MemoryDB
+from memory_engine.db import DEFAULT_DIM, MemoryDB
 
 # Spec: merge when Jaro-Winkler similarity > 0.88
 JARO_WINKLER_THRESHOLD = 0.88
 
+# Default local embedding model (384-dim, ONNX via fastembed — no cloud).
+DEFAULT_EMBED_MODEL = "BAAI/bge-small-en-v1.5"
+
 # ---------------------------------------------------------------------------
-# GBNF grammar — forces the LLM to emit a JSON array of memory objects.
-# Compatible with llama-cpp-python's `grammar=` / LlamaGrammar.from_string().
+# GBNF grammar — forces llama.cpp to emit a JSON array of memory objects.
+# IMPORTANT: llama.cpp GBNF does NOT allow multiline RHS continuations; each
+# rule must be on a single line or the parser reports "expecting name".
+# Passed to llama-cpp-python as LlamaGrammar.from_string(MEMORY_JSON_GBNF).
 # ---------------------------------------------------------------------------
 
 MEMORY_JSON_GBNF = r"""
-root        ::= "[" ws memory ("," ws memory)* ws "]"
-memory      ::= "{" ws
-                "\"entity\""    ws ":" ws string "," ws
-                "\"attribute\"" ws ":" ws string "," ws
-                "\"value\""     ws ":" ws string "," ws
-                "\"confidence\"" ws ":" ws number "," ws
-                "\"is_permanent\"" ws ":" ws boolean
-                ws "}"
-string      ::= "\"" chars "\""
-chars       ::= char*
-char        ::= [^"\\] | "\\" escape
-escape      ::= ["\\/bfnrt] | "u" hex hex hex hex
-hex         ::= [0-9a-fA-F]
-number      ::= "0" | [1-9] [0-9]? ("." [0-9]+)?
-boolean     ::= "true" | "false"
-ws          ::= [ \t\n\r]*
+root ::= "[" ws (memory ("," ws memory)*)? ws "]"
+memory ::= "{" ws "\"" "entity" "\"" ws ":" ws string "," ws "\"" "attribute" "\"" ws ":" ws string "," ws "\"" "value" "\"" ws ":" ws string "," ws "\"" "confidence" "\"" ws ":" ws number "," ws "\"" "is_permanent" "\"" ws ":" ws boolean ws "}"
+string ::= "\"" chars "\""
+chars ::= char*
+char ::= [^"\\] | "\\" escape
+escape ::= ["\\/bfnrt] | "u" hex hex hex hex
+hex ::= [0-9a-fA-F]
+number ::= ("0" | "1") ("." [0-9]+)?
+boolean ::= "true" | "false"
+ws ::= [ \t\n\r]*
 """
+
+# Equivalent JSON Schema (optional path via LlamaGrammar.from_json_schema).
+MEMORY_JSON_SCHEMA = {
+    "type": "array",
+    "items": {
+        "type": "object",
+        "properties": {
+            "entity": {"type": "string"},
+            "attribute": {"type": "string"},
+            "value": {"type": "string"},
+            "confidence": {"type": "number"},
+            "is_permanent": {"type": "boolean"},
+        },
+        "required": [
+            "entity",
+            "attribute",
+            "value",
+            "confidence",
+            "is_permanent",
+        ],
+    },
+}
 
 EXTRACTION_SYSTEM_PROMPT = """\
 You extract durable personal memory facts from a conversation.
@@ -46,6 +69,7 @@ Return ONLY a JSON array. Each element must have:
   confidence (0-1 number), is_permanent (boolean).
 Skip greetings, ephemeral chit-chat, and anything not worth remembering.
 Prefer canonical entity names (e.g. "Bryan" not "he").
+If there are no memorable facts, return [].
 """
 
 
@@ -62,15 +86,102 @@ class ExtractedFact:
 
 
 class LLMBackend(Protocol):
-    """Minimal interface so MockLLM and llama-cpp-python share a call site."""
+    """Minimal interface so MockLLM and LlamaCppBackend share a call site."""
 
     def complete(self, prompt: str, *, grammar: Optional[str] = None) -> str: ...
 
 
+class Embedder(Protocol):
+    """Local embedding interface (fastembed or llama.cpp)."""
+
+    @property
+    def dim(self) -> int: ...
+
+    def embed(self, text: str, dim: Optional[int] = None) -> np.ndarray: ...
+
+
+# ---------------------------------------------------------------------------
+# Real local embeddings (replaces hashing-trick mock vectors)
+# ---------------------------------------------------------------------------
+
+class LocalEmbedder:
+    """
+    ONNX sentence embeddings via fastembed — fully local, zero API calls.
+    Default model: BAAI/bge-small-en-v1.5 (384-dim).
+    """
+
+    def __init__(self, model_name: str = DEFAULT_EMBED_MODEL) -> None:
+        from fastembed import TextEmbedding
+
+        self.model_name = model_name
+        self._model = TextEmbedding(model_name=model_name)
+        # Probe dimensionality once.
+        probe = next(self._model.embed(["dimension probe"]))
+        self._dim = int(np.asarray(probe, dtype=np.float32).shape[0])
+
+    @property
+    def dim(self) -> int:
+        return self._dim
+
+    def embed(self, text: str, dim: Optional[int] = None) -> np.ndarray:
+        target = dim or self._dim
+        raw = next(self._model.embed([text]))
+        vec = np.asarray(raw, dtype=np.float32).ravel()
+        if vec.shape[0] == target:
+            return _l2_normalize(vec)
+        out = np.zeros(target, dtype=np.float32)
+        n = min(target, vec.shape[0])
+        out[:n] = vec[:n]
+        return _l2_normalize(out)
+
+
+_EMBEDDER_SINGLETON: Optional[LocalEmbedder] = None
+
+
+def get_local_embedder(model_name: str = DEFAULT_EMBED_MODEL) -> LocalEmbedder:
+    """Process-wide LocalEmbedder (model load is relatively expensive)."""
+    global _EMBEDDER_SINGLETON
+    if (
+        _EMBEDDER_SINGLETON is None
+        or _EMBEDDER_SINGLETON.model_name != model_name
+    ):
+        _EMBEDDER_SINGLETON = LocalEmbedder(model_name=model_name)
+    return _EMBEDDER_SINGLETON
+
+
+def _l2_normalize(vec: np.ndarray) -> np.ndarray:
+    norm = float(np.linalg.norm(vec))
+    if norm > 0.0:
+        vec = vec / norm
+    return vec
+
+
+def hashing_embed(text: str, dim: int = DEFAULT_DIM) -> np.ndarray:
+    """
+    Fallback bag-of-tokens hashing embedding when fastembed is unavailable.
+    Prefer LocalEmbedder for production / demo quality.
+    """
+    vec = np.zeros(dim, dtype=np.float32)
+    tokens = re.findall(r"[a-z0-9]+", text.lower())
+    if not tokens:
+        return vec
+    for tok in tokens:
+        h = hash(tok)
+        idx = h % dim
+        sign = 1.0 if (h & 1) == 0 else -1.0
+        vec[idx] += sign
+    return _l2_normalize(vec)
+
+
+# ---------------------------------------------------------------------------
+# Mock LLM (regex) — kept for offline / no-GGUF runs
+# ---------------------------------------------------------------------------
+
 class MockLLM:
     """
-    Deterministic, zero-dependency extractor for demos and tests.
+    Deterministic, zero-dependency extractor for demos without a GGUF model.
     Pulls simple \"X's Y is Z\" / \"My name is X\" style facts with regex.
+    Does NOT produce embeddings — pair with LocalEmbedder instead.
     """
 
     _PATTERNS: list[tuple[re.Pattern[str], Any]] = [
@@ -107,7 +218,6 @@ class MockLLM:
             ),
         ),
         (
-            # "Alice's dog is named Nimbus" before the generic "is ..." pattern
             re.compile(
                 r"(?i)\b([A-Z][a-zA-Z\-']+)'s\s+(\w+)\s+is\s+named\s+"
                 r"([A-Za-z][A-Za-z\-']*)"
@@ -138,7 +248,8 @@ class MockLLM:
     ]
 
     def complete(self, prompt: str, *, grammar: Optional[str] = None) -> str:
-        # The conversation text is expected after the last "Conversation:" marker.
+        # grammar is ignored; MockLLM is not constrained by GBNF.
+        _ = grammar
         text = prompt
         if "Conversation:" in prompt:
             text = prompt.rsplit("Conversation:", 1)[-1]
@@ -166,71 +277,134 @@ class MockLLM:
         ]
         return json.dumps(payload)
 
-    def embed(self, text: str, dim: int = 384) -> np.ndarray:
-        """Hashing trick embedding — stable, local, no model required."""
-        return hashing_embed(text, dim)
 
+# ---------------------------------------------------------------------------
+# llama-cpp-python + GBNF-constrained JSON extraction
+# ---------------------------------------------------------------------------
 
 class LlamaCppBackend:
     """
-    Thin adapter around llama-cpp-python with GBNF-constrained JSON output.
-    Instantiated only when a GGUF model path is provided.
+    Local GGUF inference via llama-cpp-python.
+
+    JSON extraction always runs under MEMORY_JSON_GBNF so the model can only
+    emit a schema-valid memory array (deterministic structure, no prose).
     """
 
-    def __init__(self, model_path: str, n_ctx: int = 2048, n_threads: int = 4) -> None:
+    def __init__(
+        self,
+        model_path: str | Path,
+        *,
+        n_ctx: int = 2048,
+        n_threads: Optional[int] = None,
+        n_gpu_layers: int = 0,
+        chat_format: Optional[str] = None,
+    ) -> None:
         from llama_cpp import Llama, LlamaGrammar  # type: ignore
 
+        path = Path(model_path).expanduser().resolve()
+        if not path.is_file():
+            raise FileNotFoundError(
+                f"GGUF model not found: {path}\n"
+                "  Pass a real .gguf path to --model, set CORTEX_MODEL, "
+                "or omit --model to use MockLLM.\n"
+                "  Example download (Hugging Face):\n"
+                "    mkdir -p ~/models && cd ~/models &&\n"
+                "    curl -L -o Llama-3.2-1B-Instruct-Q4_K_M.gguf \\\n"
+                "      'https://huggingface.co/bartowski/Llama-3.2-1B-Instruct-GGUF"
+                "/resolve/main/Llama-3.2-1B-Instruct-Q4_K_M.gguf'"
+            )
+
+        self.model_path = path
         self._LlamaGrammar = LlamaGrammar
-        self.llm = Llama(
-            model_path=model_path,
-            n_ctx=n_ctx,
-            n_threads=n_threads,
-            verbose=False,
-            embedding=True,
-        )
+        # Compile / bind the GBNF once; reuse on every extraction call.
+        # (Actual parse happens on first generate; keep rules single-line.)
+        self._json_grammar = LlamaGrammar.from_string(MEMORY_JSON_GBNF)
+
+        kwargs: dict[str, Any] = {
+            "model_path": str(path),
+            "n_ctx": n_ctx,
+            "n_threads": n_threads or max(1, (os.cpu_count() or 4) // 2),
+            "n_gpu_layers": n_gpu_layers,
+            "verbose": False,
+            "embedding": False,  # vectors come from LocalEmbedder / fastembed
+        }
+        # Prefer auto-detected chat template from GGUF metadata when present.
+        if chat_format:
+            kwargs["chat_format"] = chat_format
+
+        self.llm = Llama(**kwargs)
+
+    def _resolve_grammar(self, grammar: Optional[str] = None) -> Any:
+        if grammar and grammar.strip() != MEMORY_JSON_GBNF.strip():
+            return self._LlamaGrammar.from_string(grammar)
+        return self._json_grammar
 
     def complete(self, prompt: str, *, grammar: Optional[str] = None) -> str:
-        g = self._LlamaGrammar.from_string(grammar) if grammar else None
+        """
+        Run constrained generation under GBNF.
+
+        Prefer extract_memories() for Instruct models (uses chat template).
+        """
+        gbnf = self._resolve_grammar(grammar)
         out = self.llm(
             prompt,
             max_tokens=512,
-            temperature=0.1,
-            grammar=g,
-            stop=["</s>", "```"],
+            temperature=0.0,
+            top_p=1.0,
+            grammar=gbnf,
+            stop=["</s>", "<|eot_id|>", "<|im_end|>", "```"],
         )
         return out["choices"][0]["text"].strip()
 
-    def embed(self, text: str, dim: int = 384) -> np.ndarray:
-        raw = self.llm.create_embedding(text)["data"][0]["embedding"]
-        vec = np.asarray(raw, dtype=np.float32)
-        if vec.shape[0] == dim:
-            return vec
-        # Pad / truncate to the DB's configured dimensionality.
-        out = np.zeros(dim, dtype=np.float32)
-        n = min(dim, vec.shape[0])
-        out[:n] = vec[:n]
-        return out
+    def extract_memories(self, conversation: str) -> str:
+        """Chat-templated extraction with MEMORY_JSON_GBNF applied."""
+        gbnf = self._json_grammar
+        messages = [
+            {"role": "system", "content": EXTRACTION_SYSTEM_PROMPT},
+            {
+                "role": "user",
+                "content": (
+                    f"Conversation:\n{conversation}\n\n"
+                    "Return ONLY the JSON array of memory objects."
+                ),
+            },
+        ]
+        try:
+            out = self.llm.create_chat_completion(
+                messages=messages,
+                max_tokens=512,
+                temperature=0.0,
+                top_p=1.0,
+                grammar=gbnf,
+            )
+            return out["choices"][0]["message"]["content"].strip()
+        except Exception:
+            # Fallback if chat_format is incompatible with this GGUF.
+            prompt = (
+                f"{EXTRACTION_SYSTEM_PROMPT}\n\n"
+                f"Conversation:\n{conversation}\n\n"
+                f"JSON:"
+            )
+            return self.complete(prompt, grammar=MEMORY_JSON_GBNF)
 
 
-def hashing_embed(text: str, dim: int = 384) -> np.ndarray:
+def create_llm(
+    model_path: Optional[str | Path] = None,
+    **llama_kwargs: Any,
+) -> LLMBackend:
     """
-    Local bag-of-tokens hashing embedding (signed hashing trick).
-    Good enough for prototype vector search without a cloud model.
+    Factory: LlamaCppBackend when a GGUF path is given (or $CORTEX_MODEL),
+    otherwise MockLLM for offline demos.
     """
-    vec = np.zeros(dim, dtype=np.float32)
-    tokens = re.findall(r"[a-z0-9]+", text.lower())
-    if not tokens:
-        return vec
-    for tok in tokens:
-        h = hash(tok)
-        idx = h % dim
-        sign = 1.0 if (h & 1) == 0 else -1.0
-        vec[idx] += sign
-    norm = float(np.linalg.norm(vec))
-    if norm > 0:
-        vec /= norm
-    return vec
+    path = model_path or os.environ.get("CORTEX_MODEL")
+    if path:
+        return LlamaCppBackend(path, **llama_kwargs)
+    return MockLLM()
 
+
+# ---------------------------------------------------------------------------
+# Parsing + Jaro-Winkler dedup
+# ---------------------------------------------------------------------------
 
 def parse_facts(raw: str) -> list[ExtractedFact]:
     """Parse LLM JSON (possibly fenced) into ExtractedFact list."""
@@ -239,7 +413,6 @@ def parse_facts(raw: str) -> list[ExtractedFact]:
         text = re.sub(r"^```(?:json)?\s*", "", text)
         text = re.sub(r"\s*```$", "", text)
 
-    # Recover the outermost JSON array if the model added prose.
     start, end = text.find("["), text.rfind("]")
     if start == -1 or end == -1 or end < start:
         return []
@@ -252,12 +425,14 @@ def parse_facts(raw: str) -> list[ExtractedFact]:
         if not isinstance(item, dict):
             continue
         try:
+            conf = float(item.get("confidence", 1.0))
+            conf = min(1.0, max(0.0, conf))
             facts.append(
                 ExtractedFact(
                     entity=str(item["entity"]).strip(),
                     attribute=str(item["attribute"]).strip(),
                     value=str(item["value"]).strip(),
-                    confidence=float(item.get("confidence", 1.0)),
+                    confidence=conf,
                     is_permanent=bool(item.get("is_permanent", False)),
                 )
             )
@@ -291,10 +466,15 @@ def find_duplicate_entity(
     return None
 
 
+# ---------------------------------------------------------------------------
+# Ingestion pipeline
+# ---------------------------------------------------------------------------
+
 class MemoryExtractor:
     """
     Deduplicating ingestion pipeline:
-      conversation → (GBNF) JSON facts → Jaro-Winkler entity merge → SQLite.
+      conversation → (GBNF) JSON facts → Jaro-Winkler entity merge → SQLite
+      with real local embeddings (fastembed) written alongside each fact.
     """
 
     def __init__(
@@ -302,23 +482,50 @@ class MemoryExtractor:
         db: MemoryDB,
         llm: Optional[LLMBackend] = None,
         *,
+        embedder: Optional[Embedder] = None,
         threshold: float = JARO_WINKLER_THRESHOLD,
+        use_fastembed: bool = True,
     ) -> None:
         self.db = db
         self.llm = llm or MockLLM()
         self.threshold = threshold
+        self.embedder = embedder
+        if self.embedder is None and use_fastembed:
+            try:
+                self.embedder = get_local_embedder()
+                # Align DB dim with the real model if still at default empty DB.
+                if self.embedder.dim != self.db.dim:
+                    # Only safe when no rows yet; otherwise keep DB dim + pad/trim.
+                    n = self.db.conn.execute(
+                        "SELECT COUNT(*) AS c FROM memories_meta"
+                    ).fetchone()["c"]
+                    if int(n) == 0:
+                        self.db.dim = self.embedder.dim
+            except Exception:
+                self.embedder = None
 
     def _embed(self, text: str) -> np.ndarray:
-        embed_fn = getattr(self.llm, "embed", None)
-        if callable(embed_fn):
-            return np.asarray(embed_fn(text, self.db.dim), dtype=np.float32)
+        if self.embedder is not None:
+            return np.asarray(
+                self.embedder.embed(text, self.db.dim), dtype=np.float32
+            )
+        # Last-resort fallback if fastembed is not installed.
         return hashing_embed(text, self.db.dim)
 
     def extract_from_text(self, conversation: str) -> list[ExtractedFact]:
-        prompt = (
-            f"{EXTRACTION_SYSTEM_PROMPT}\n\nConversation:\n{conversation}\n\nJSON:"
-        )
-        raw = self.llm.complete(prompt, grammar=MEMORY_JSON_GBNF)
+        # Prefer chat-templated GBNF extraction on LlamaCppBackend.
+        extract_fn = getattr(self.llm, "extract_memories", None)
+        if callable(extract_fn):
+            raw = extract_fn(conversation)
+        else:
+            prompt = (
+                f"{EXTRACTION_SYSTEM_PROMPT}\n\n"
+                f"Conversation:\n{conversation}\n\n"
+                f"JSON:"
+            )
+            # Always pass the GBNF string — LlamaCppBackend applies it;
+            # MockLLM ignores it.
+            raw = self.llm.complete(prompt, grammar=MEMORY_JSON_GBNF)
         return parse_facts(raw)
 
     def ingest(self, conversation: str) -> list[dict[str, Any]]:
@@ -342,12 +549,8 @@ class MemoryExtractor:
             )
 
             if dup_id is not None:
-                # Merge into the matched entity row (update attribute/value).
                 matched = self.db.get_memory(dup_id)
-                # Prefer the canonical (existing) entity spelling on merge.
                 canon_entity = matched["entity"] if matched else fact.entity
-                # If the matched row is a different attribute, insert a sibling
-                # under the canonical entity name rather than overwriting.
                 if matched and matched["attribute"].lower() != fact.attribute.lower():
                     new_id = self.db.insert_memory(
                         entity=canon_entity,
