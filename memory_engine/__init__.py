@@ -6,15 +6,19 @@ from memory_engine.extraction import (
     LlamaCppBackend,
     LocalEmbedder,
     MemoryExtractor,
+    MemoryStack,
     MockLLM,
     create_llm,
     get_local_embedder,
+    require_local_embedder,
+    resolve_model_path,
 )
 from memory_engine.retrieval import HybridRetriever
 
 __all__ = [
     "MemoryDB",
     "MemoryExtractor",
+    "MemoryStack",
     "MockLLM",
     "LlamaCppBackend",
     "LocalEmbedder",
@@ -22,6 +26,8 @@ __all__ = [
     "JARO_WINKLER_THRESHOLD",
     "create_llm",
     "get_local_embedder",
+    "require_local_embedder",
+    "resolve_model_path",
 ]
 
 __version__ = "0.1.0"

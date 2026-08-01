@@ -179,9 +179,8 @@ def hashing_embed(text: str, dim: int = DEFAULT_DIM) -> np.ndarray:
 
 class MockLLM:
     """
-    Deterministic, zero-dependency extractor for demos without a GGUF model.
-    Pulls simple \"X's Y is Z\" / \"My name is X\" style facts with regex.
-    Does NOT produce embeddings — pair with LocalEmbedder instead.
+    Regex extractor for offline unit tests only (--mock).
+    Production path uses LlamaCppBackend + MEMORY_JSON_GBNF.
     """
 
     _PATTERNS: list[tuple[re.Pattern[str], Any]] = [
@@ -306,7 +305,7 @@ class LlamaCppBackend:
             raise FileNotFoundError(
                 f"GGUF model not found: {path}\n"
                 "  Pass a real .gguf path to --model, set CORTEX_MODEL, "
-                "or omit --model to use MockLLM.\n"
+                "or place the model at ~/models/Llama-3.2-1B-Instruct-Q4_K_M.gguf.\n"
                 "  Example download (Hugging Face):\n"
                 "    mkdir -p ~/models && cd ~/models &&\n"
                 "    curl -L -o Llama-3.2-1B-Instruct-Q4_K_M.gguf \\\n"
@@ -390,16 +389,115 @@ class LlamaCppBackend:
 
 def create_llm(
     model_path: Optional[str | Path] = None,
+    *,
+    allow_mock: bool = False,
     **llama_kwargs: Any,
 ) -> LLMBackend:
     """
-    Factory: LlamaCppBackend when a GGUF path is given (or $CORTEX_MODEL),
-    otherwise MockLLM for offline demos.
+    Factory for the local extraction backend.
+
+    Default: LlamaCppBackend (GGUF + GBNF). Pass allow_mock=True only for
+    offline unit tests without a model file.
     """
-    path = model_path or os.environ.get("CORTEX_MODEL")
-    if path:
+    path = resolve_model_path(model_path)
+    if path is not None:
         return LlamaCppBackend(path, **llama_kwargs)
-    return MockLLM()
+    if allow_mock:
+        return MockLLM()
+    raise FileNotFoundError(
+        "No GGUF model found. Set --model / CORTEX_MODEL, or place a model at "
+        f"{DEFAULT_MODEL_CANDIDATES[0]}.\n"
+        "Download example:\n"
+        "  mkdir -p ~/models && curl -L -o "
+        "~/models/Llama-3.2-1B-Instruct-Q4_K_M.gguf \\\n"
+        "    'https://huggingface.co/bartowski/Llama-3.2-1B-Instruct-GGUF"
+        "/resolve/main/Llama-3.2-1B-Instruct-Q4_K_M.gguf'"
+    )
+
+
+# Default local GGUF search order (first existing file wins).
+DEFAULT_MODEL_CANDIDATES = (
+    Path.home() / "models" / "Llama-3.2-1B-Instruct-Q4_K_M.gguf",
+    Path.home() / "models" / "llama.gguf",
+)
+
+
+def resolve_model_path(model_path: Optional[str | Path] = None) -> Optional[Path]:
+    """Resolve a GGUF path from arg, $CORTEX_MODEL, or well-known defaults."""
+    candidates: list[Path] = []
+    if model_path:
+        candidates.append(Path(model_path).expanduser())
+    env = os.environ.get("CORTEX_MODEL")
+    if env:
+        candidates.append(Path(env).expanduser())
+    candidates.extend(DEFAULT_MODEL_CANDIDATES)
+    for cand in candidates:
+        if cand.is_file():
+            return cand.resolve()
+    return None
+
+
+def require_local_embedder(model_name: str = DEFAULT_EMBED_MODEL) -> LocalEmbedder:
+    """Load fastembed or raise a clear install error (no silent mock vectors)."""
+    try:
+        return get_local_embedder(model_name)
+    except ImportError as exc:
+        raise ImportError(
+            "fastembed is required for local vector generation. "
+            "Install with: pip install fastembed"
+        ) from exc
+    except Exception as exc:
+        raise RuntimeError(
+            f"Failed to load local embedder '{model_name}': {exc}"
+        ) from exc
+
+
+class MemoryStack:
+    """
+    Wired local memory system:
+      fastembed vectors + llama-cpp GBNF extraction + SQLite hybrid retrieval.
+    """
+
+    def __init__(
+        self,
+        db_path: str | Path = "memories.db",
+        *,
+        model_path: Optional[str | Path] = None,
+        allow_mock: bool = False,
+        embed_model: str = DEFAULT_EMBED_MODEL,
+    ) -> None:
+        # Lazy import avoids extraction ↔ retrieval circular dependency.
+        from memory_engine.retrieval import HybridRetriever
+
+        self.embedder = require_local_embedder(embed_model)
+        self.llm = create_llm(model_path, allow_mock=allow_mock)
+        self.db = MemoryDB(db_path, dim=self.embedder.dim)
+        self.extractor = MemoryExtractor(
+            self.db,
+            self.llm,
+            embedder=self.embedder,
+            require_fastembed=True,
+        )
+        self.retriever = HybridRetriever(
+            self.db,
+            embed_fn=lambda text: self.embedder.embed(text, self.db.dim),
+            require_fastembed=True,
+        )
+
+    def remember(self, conversation: str) -> list[dict[str, Any]]:
+        return self.extractor.ingest(conversation)
+
+    def recall(self, query: str, *, top_k: int = 5) -> list[Any]:
+        return self.retriever.retrieve(query, top_k=top_k)
+
+    def close(self) -> None:
+        self.db.close()
+
+    def __enter__(self) -> "MemoryStack":
+        return self
+
+    def __exit__(self, *exc: Any) -> None:
+        self.close()
 
 
 # ---------------------------------------------------------------------------
@@ -473,8 +571,8 @@ def find_duplicate_entity(
 class MemoryExtractor:
     """
     Deduplicating ingestion pipeline:
-      conversation → (GBNF) JSON facts → Jaro-Winkler entity merge → SQLite
-      with real local embeddings (fastembed) written alongside each fact.
+      conversation → llama-cpp (GBNF) JSON facts → Jaro-Winkler merge → SQLite
+      with fastembed vectors written alongside each fact.
     """
 
     def __init__(
@@ -484,33 +582,35 @@ class MemoryExtractor:
         *,
         embedder: Optional[Embedder] = None,
         threshold: float = JARO_WINKLER_THRESHOLD,
-        use_fastembed: bool = True,
+        require_fastembed: bool = True,
+        allow_mock_llm: bool = False,
     ) -> None:
         self.db = db
-        self.llm = llm or MockLLM()
+        if llm is None:
+            self.llm = create_llm(allow_mock=allow_mock_llm)
+        else:
+            self.llm = llm
         self.threshold = threshold
-        self.embedder = embedder
-        if self.embedder is None and use_fastembed:
-            try:
-                self.embedder = get_local_embedder()
-                # Align DB dim with the real model if still at default empty DB.
-                if self.embedder.dim != self.db.dim:
-                    # Only safe when no rows yet; otherwise keep DB dim + pad/trim.
-                    n = self.db.conn.execute(
-                        "SELECT COUNT(*) AS c FROM memories_meta"
-                    ).fetchone()["c"]
-                    if int(n) == 0:
-                        self.db.dim = self.embedder.dim
-            except Exception:
-                self.embedder = None
+
+        if embedder is not None:
+            self.embedder = embedder
+        elif require_fastembed:
+            self.embedder = require_local_embedder()
+            if self.embedder.dim != self.db.dim:
+                n = self.db.conn.execute(
+                    "SELECT COUNT(*) AS c FROM memories_meta"
+                ).fetchone()["c"]
+                if int(n) == 0:
+                    self.db.dim = self.embedder.dim
+        else:
+            self.embedder = None
 
     def _embed(self, text: str) -> np.ndarray:
-        if self.embedder is not None:
-            return np.asarray(
-                self.embedder.embed(text, self.db.dim), dtype=np.float32
+        if self.embedder is None:
+            raise RuntimeError(
+                "No embedder configured. LocalEmbedder / fastembed is required."
             )
-        # Last-resort fallback if fastembed is not installed.
-        return hashing_embed(text, self.db.dim)
+        return np.asarray(self.embedder.embed(text, self.db.dim), dtype=np.float32)
 
     def extract_from_text(self, conversation: str) -> list[ExtractedFact]:
         # Prefer chat-templated GBNF extraction on LlamaCppBackend.
@@ -524,7 +624,7 @@ class MemoryExtractor:
                 f"JSON:"
             )
             # Always pass the GBNF string — LlamaCppBackend applies it;
-            # MockLLM ignores it.
+            # MockLLM (tests only) ignores it.
             raw = self.llm.complete(prompt, grammar=MEMORY_JSON_GBNF)
         return parse_facts(raw)
 

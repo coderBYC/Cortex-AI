@@ -1,11 +1,18 @@
 #!/usr/bin/env python3
 """
-Runnable Phase 1 demonstration of the local-first memory engine.
+Living local AI memory system (fastembed + llama-cpp GBNF).
 
-Usage:
+Interactive REPL (default):
     python -m memory_engine.main
-    python -m memory_engine.main --db ./demo_memories.db --keep
-    python -m memory_engine.main --model ~/models/llama-3.2-3b-instruct.Q4_K_M.gguf
+    python -m memory_engine.main --db ./memories.db
+
+One-shot:
+    python -m memory_engine.main remember "My name is Bryan. I live in Ann Arbor."
+    python -m memory_engine.main ask "Where does Bryan live?"
+    python -m memory_engine.main list
+
+Scripted smoke demo (still uses real llama + fastembed):
+    python -m memory_engine.main --demo
 """
 
 from __future__ import annotations
@@ -13,179 +20,248 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-import tempfile
 from pathlib import Path
 
-from memory_engine.db import MemoryDB
 from memory_engine.extraction import (
     JARO_WINKLER_THRESHOLD,
     MEMORY_JSON_GBNF,
-    MemoryExtractor,
-    create_llm,
-    get_local_embedder,
-    jaro_winkler,
+    MemoryStack,
+    resolve_model_path,
 )
-from memory_engine.retrieval import DEFAULT_LAMBDA, HybridRetriever
-
-
-DEMO_CONVERSATIONS = [
-    "Hi! My name is Bryan. I live in Ann Arbor and I'm a software engineer. "
-    "I prefer dark mode editors and I love espresso.",
-    # "Brian" ≈ "Bryan" (Jaro-Winkler > 0.88) → merge into existing entity.
-    "Just a reminder — Brian's occupation is staff engineer. "
-    "Bryan's location is Ann Arbor, Michigan.",
-    "Alice's birthday is March 3rd. Alice's dog is named Nimbus.",
-]
-
-
-DEMO_QUERIES = [
-    "Where does Bryan live?",
-    "What does Bryan do for work?",
-    "Tell me about Alice's dog",
-    "editor preferences",
-]
+from memory_engine.retrieval import DEFAULT_LAMBDA
 
 
 def banner(title: str) -> None:
     print(f"\n{'=' * 60}\n  {title}\n{'=' * 60}")
 
 
-def run_demo(
-    db_path: Path,
-    *,
-    keep_db: bool = False,
-    model_path: Path | None = None,
-    no_fastembed: bool = False,
-) -> int:
-    banner("Local-First Memory Engine — Phase 1 Demo")
-    print(f"DB path          : {db_path}")
+def print_actions(actions: list[dict]) -> None:
+    if not actions:
+        print("  (no durable facts extracted)")
+        return
+    for a in actions:
+        extra = f"  (sim={a['similarity']:.3f})" if "similarity" in a else ""
+        print(
+            f"  → {a['action']:24s} id={a['id']}  "
+            f"{a['entity']}.{a['attribute']} = {a['value']}{extra}"
+        )
+
+
+def print_hits(hits: list) -> None:
+    if not hits:
+        print("  (no hits)")
+        return
+    for h in hits:
+        print(
+            f"  score={h.final_score:.6f}  "
+            f"rrf={h.rrf:.5f} decay={h.decay:.4f}  "
+            f"vec#{h.rank_vec} bm25#{h.rank_bm25}  "
+            f"→ {h.entity}'s {h.attribute} is {h.value}"
+        )
+
+
+def print_stack_info(stack: MemoryStack) -> None:
+    model = getattr(stack.llm, "model_path", None)
+    print(f"DB path          : {stack.db.db_path}")
     print(f"JW threshold     : {JARO_WINKLER_THRESHOLD}")
     print(f"Decay λ (hrs)    : {DEFAULT_LAMBDA}")
     print(f"GBNF grammar     : {len(MEMORY_JSON_GBNF)} chars (JSON-constrained)")
+    print(
+        f"embeddings       : fastembed "
+        f"({stack.embedder.model_name}, dim={stack.embedder.dim})"
+    )
+    print(f"extractor LLM    : {type(stack.llm).__name__}"
+          + (f" ({model})" if model else ""))
+    print(
+        f"sqlite-vec       : "
+        f"{'enabled' if stack.db.vec_enabled else 'numpy fallback'}"
+    )
 
-    embedder = None
-    if not no_fastembed:
+
+def run_repl(stack: MemoryStack) -> int:
+    banner("Cortex — Local AI Memory (REPL)")
+    print_stack_info(stack)
+    print(
+        "\nCommands:\n"
+        "  remember <text>   ingest conversation → GBNF extract → SQLite\n"
+        "  ask <query>       hybrid BM25 + vector recall\n"
+        "  list              show active memories\n"
+        "  help              show this help\n"
+        "  quit              exit\n"
+    )
+    while True:
         try:
-            embedder = get_local_embedder()
-            print(f"embeddings       : fastembed ({embedder.model_name}, dim={embedder.dim})")
-        except Exception as exc:
-            print(f"embeddings       : hashing fallback ({exc})")
-    else:
-        print("embeddings       : hashing fallback (--no-fastembed)")
-
-    llm = create_llm(model_path)
-    llm_name = type(llm).__name__
-    print(f"extractor LLM    : {llm_name}"
-          + (f" ({model_path})" if model_path else ""))
-
-    db_dim = embedder.dim if embedder is not None else 384
-    with MemoryDB(db_path, dim=db_dim) as db:
-        print(f"sqlite-vec       : {'enabled' if db.vec_enabled else 'numpy fallback'}")
-
-        extractor = MemoryExtractor(
-            db, llm, embedder=embedder, use_fastembed=not no_fastembed
-        )
-        retriever = HybridRetriever(
-            db,
-            embed_fn=(lambda t: embedder.embed(t, db.dim)) if embedder else None,
-            use_fastembed=not no_fastembed and embedder is None,
-        )
-
-        # --- Ingestion -------------------------------------------------------
-        banner("1. Deduplicating Ingestion")
-        for i, convo in enumerate(DEMO_CONVERSATIONS, 1):
-            print(f"\n--- conversation {i} ---")
-            print(f"  {convo[:100]}{'...' if len(convo) > 100 else ''}")
-            actions = extractor.ingest(convo)
-            for a in actions:
-                print(f"  → {a['action']:24s} id={a['id']}  "
-                      f"{a['entity']}.{a['attribute']} = {a['value']}"
-                      + (f"  (sim={a['similarity']:.3f})" if "similarity" in a else ""))
-
-        sim = jaro_winkler("Bryan", "Brian")
-        print(f"\n  Jaro-Winkler('Bryan','Brian') = {sim:.4f} "
-              f"(threshold {JARO_WINKLER_THRESHOLD} → "
-              f"{'MERGE' if sim > JARO_WINKLER_THRESHOLD else 'INSERT'})")
-
-        banner("2. Active memories in SQLite")
-        for row in db.dump_active():
-            perm = "permanent" if row["is_permanent"] else "decaying"
+            line = input("cortex> ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            break
+        if not line:
+            continue
+        if line in {"quit", "exit", "q"}:
+            break
+        if line in {"help", "?"}:
             print(
-                f"  [{row['id']:3d}] {row['entity']:12s} "
-                f"{row['attribute']:24s} = {row['value']!r:30s}  ({perm})"
+                "  remember <text> | ask <query> | list | quit"
             )
-
-        # --- Retrieval -------------------------------------------------------
-        banner("3. Hybrid RRF + Time-Decay Retrieval")
-        for q in DEMO_QUERIES:
-            print(f"\n  query: {q!r}")
-            hits = retriever.retrieve(q, top_k=3)
-            if not hits:
-                print("    (no hits)")
-                continue
-            for h in hits:
+            continue
+        if line == "list":
+            rows = stack.db.dump_active()
+            if not rows:
+                print("  (empty)")
+            for row in rows:
+                perm = "permanent" if row["is_permanent"] else "decaying"
                 print(
-                    f"    score={h.final_score:.6f}  "
-                    f"rrf={h.rrf:.5f} decay={h.decay:.4f}  "
-                    f"vec#{h.rank_vec} bm25#{h.rank_bm25}  "
-                    f"→ {h.entity}'s {h.attribute} is {h.value}"
+                    f"  [{row['id']:3d}] {row['entity']:12s} "
+                    f"{row['attribute']:24s} = {row['value']!r}  ({perm})"
                 )
+            continue
 
-        banner("4. Machine-readable top hit for first query")
-        top = retriever.retrieve(DEMO_QUERIES[0], top_k=1)
-        print(json.dumps([h.as_dict() for h in top], indent=2))
+        if line.startswith("remember "):
+            text = line[len("remember "):].strip()
+            if not text:
+                print("  usage: remember <conversation text>")
+                continue
+            print_actions(stack.remember(text))
+            continue
 
-    if not keep_db and db_path.exists() and str(db_path).startswith(tempfile.gettempdir()):
-        db_path.unlink(missing_ok=True)
-        Path(str(db_path) + "-wal").unlink(missing_ok=True)
-        Path(str(db_path) + "-shm").unlink(missing_ok=True)
+        if line.startswith("ask "):
+            query = line[len("ask "):].strip()
+            if not query:
+                print("  usage: ask <query>")
+                continue
+            print_hits(stack.recall(query, top_k=5))
+            continue
 
+        # Bare text defaults to remember (living conversation capture).
+        print_actions(stack.remember(line))
+
+    return 0
+
+
+def run_oneshot(stack: MemoryStack, command: str, text: str) -> int:
+    if command == "remember":
+        print_actions(stack.remember(text))
+        return 0
+    if command == "ask":
+        hits = stack.recall(text, top_k=5)
+        print_hits(hits)
+        print(json.dumps([h.as_dict() for h in hits], indent=2))
+        return 0
+    if command == "list":
+        print(json.dumps(stack.db.dump_active(), indent=2))
+        return 0
+    print(f"unknown command: {command}", file=sys.stderr)
+    return 2
+
+
+def run_demo(stack: MemoryStack) -> int:
+    """Scripted smoke test — still real llama-cpp + fastembed, not mocks."""
+    samples = [
+        "Hi! My name is Bryan. I live in Ann Arbor and I'm a software engineer. "
+        "I prefer dark mode editors and I love espresso.",
+        "Just a reminder — Brian's occupation is staff engineer. "
+        "Bryan's location is Ann Arbor, Michigan.",
+        "Alice's birthday is March 3rd. Alice's dog is named Nimbus.",
+    ]
+    queries = [
+        "Where does Bryan live?",
+        "What does Bryan do for work?",
+        "Tell me about Alice's dog",
+        "editor preferences",
+    ]
+
+    banner("Cortex — Local AI Memory (demo)")
+    print_stack_info(stack)
+
+    banner("1. Deduplicating Ingestion (llama-cpp + GBNF)")
+    for i, convo in enumerate(samples, 1):
+        print(f"\n--- conversation {i} ---")
+        print(f"  {convo[:100]}{'...' if len(convo) > 100 else ''}")
+        print_actions(stack.remember(convo))
+
+    banner("2. Active memories in SQLite")
+    for row in stack.db.dump_active():
+        perm = "permanent" if row["is_permanent"] else "decaying"
+        print(
+            f"  [{row['id']:3d}] {row['entity']:12s} "
+            f"{row['attribute']:24s} = {row['value']!r:30s}  ({perm})"
+        )
+
+    banner("3. Hybrid RRF + Time-Decay Retrieval (fastembed vectors)")
+    for q in queries:
+        print(f"\n  query: {q!r}")
+        print_hits(stack.recall(q, top_k=3))
+
+    banner("4. Machine-readable top hit")
+    top = stack.recall(queries[0], top_k=1)
+    print(json.dumps([h.as_dict() for h in top], indent=2))
     print("\nDone.")
     return 0
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Phase 1 local memory engine demo")
+    parser = argparse.ArgumentParser(
+        description="Local-first AI memory (fastembed + llama-cpp GBNF)"
+    )
     parser.add_argument(
         "--db",
         type=Path,
-        default=None,
-        help="SQLite path (default: temp file, deleted after run)",
-    )
-    parser.add_argument(
-        "--keep",
-        action="store_true",
-        help="Keep the DB file after the demo finishes",
+        default=Path("memories.db"),
+        help="SQLite path (default: ./memories.db)",
     )
     parser.add_argument(
         "--model",
         type=Path,
         default=None,
-        help="Path to a local GGUF model for GBNF JSON extraction "
-             "(or set CORTEX_MODEL). Default: MockLLM.",
+        help="GGUF path for llama-cpp extraction "
+             "(default: $CORTEX_MODEL or ~/models/Llama-3.2-1B-Instruct-Q4_K_M.gguf)",
     )
     parser.add_argument(
-        "--no-fastembed",
+        "--demo",
         action="store_true",
-        help="Disable fastembed and use hashing-trick vectors",
+        help="Run scripted smoke demo with real local models",
+    )
+    parser.add_argument(
+        "--mock",
+        action="store_true",
+        help="Allow MockLLM fallback (tests only — not for living use)",
+    )
+    parser.add_argument(
+        "command",
+        nargs="?",
+        choices=("remember", "ask", "list"),
+        help="Optional one-shot command",
+    )
+    parser.add_argument(
+        "text",
+        nargs="?",
+        default="",
+        help="Text for remember/ask",
     )
     args = parser.parse_args(argv)
 
-    if args.db is None:
-        tmp = tempfile.NamedTemporaryFile(prefix="memories_", suffix=".db", delete=False)
-        db_path = Path(tmp.name)
-        tmp.close()
-        keep = args.keep
-    else:
-        db_path = args.db
-        keep = True
+    resolved = resolve_model_path(args.model)
+    if resolved is None and not args.mock:
+        print(
+            "No GGUF model found. Download one or pass --model.\n"
+            f"  Expected: {Path.home() / 'models' / 'Llama-3.2-1B-Instruct-Q4_K_M.gguf'}",
+            file=sys.stderr,
+        )
+        return 1
 
-    return run_demo(
-        db_path,
-        keep_db=keep,
+    with MemoryStack(
+        args.db,
         model_path=args.model,
-        no_fastembed=args.no_fastembed,
-    )
+        allow_mock=args.mock,
+    ) as stack:
+        if args.demo:
+            return run_demo(stack)
+        if args.command:
+            if args.command in {"remember", "ask"} and not args.text:
+                print(f"usage: ... {args.command} <text>", file=sys.stderr)
+                return 2
+            return run_oneshot(stack, args.command, args.text)
+        return run_repl(stack)
 
 
 if __name__ == "__main__":

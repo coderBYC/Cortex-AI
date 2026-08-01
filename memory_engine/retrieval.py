@@ -99,20 +99,18 @@ class HybridRetriever:
         lam: float = DEFAULT_LAMBDA,
         rrf_k: int = RRF_K,
         embed_fn: Optional[Any] = None,
-        use_fastembed: bool = True,
+        require_fastembed: bool = True,
     ) -> None:
         self.db = db
         self.lam = lam
         self.rrf_k = rrf_k
         if embed_fn is not None:
             self.embed_fn = embed_fn
-        elif use_fastembed:
-            try:
-                embedder = get_local_embedder()
-                self.embed_fn = lambda text: embedder.embed(text, db.dim)
-            except Exception:
-                self.embed_fn = lambda text: hashing_embed(text, db.dim)
+        elif require_fastembed:
+            embedder = get_local_embedder()
+            self.embed_fn = lambda text: embedder.embed(text, db.dim)
         else:
+            # Explicit opt-out only (tests). Production path uses fastembed.
             self.embed_fn = lambda text: hashing_embed(text, db.dim)
 
     def retrieve(
