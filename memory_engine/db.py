@@ -80,6 +80,16 @@ class MemoryDB:
         else:
             self._apply_inline_schema()
 
+        # Migrate older DBs that predate parent_context.
+        cols = {
+            r[1]
+            for r in self.conn.execute("PRAGMA table_info(memories_meta)").fetchall()
+        }
+        if "parent_context" not in cols:
+            self.conn.execute(
+                "ALTER TABLE memories_meta ADD COLUMN parent_context TEXT"
+            )
+
         if self.vec_enabled:
             self.conn.execute(
                 f"""
@@ -106,7 +116,8 @@ class MemoryDB:
                 created_at      TEXT    NOT NULL,
                 invalidated_at  TEXT,
                 is_permanent    INTEGER NOT NULL DEFAULT 0,
-                embedding       BLOB
+                embedding       BLOB,
+                parent_context  TEXT
             );
 
             CREATE INDEX IF NOT EXISTS idx_memories_meta_entity
@@ -166,8 +177,15 @@ class MemoryDB:
         *,
         is_permanent: bool = False,
         created_at: Optional[str] = None,
+        parent_context: Optional[str] = None,
     ) -> int:
-        """Insert a new memory into meta + FTS + vec. Returns the new row id."""
+        """
+        Insert a child memory into meta + FTS + vec.
+
+        `value` is the child fact used for BM25 / vector indexing.
+        `parent_context` is the optional parent session snippet expanded into
+        the answer prompt at retrieval time (not separately vectorized).
+        """
         created = created_at or _utc_now_iso()
         emb = np.asarray(embedding, dtype=np.float32).ravel()
         if emb.shape[0] != self.dim:
@@ -177,8 +195,8 @@ class MemoryDB:
             """
             INSERT INTO memories_meta
                 (entity, attribute, value, confidence, created_at, invalidated_at,
-                 is_permanent, embedding)
-            VALUES (?, ?, ?, ?, ?, NULL, ?, ?)
+                 is_permanent, embedding, parent_context)
+            VALUES (?, ?, ?, ?, ?, NULL, ?, ?, ?)
             """,
             (
                 entity,
@@ -188,9 +206,11 @@ class MemoryDB:
                 created,
                 1 if is_permanent else 0,
                 pack_embedding(emb),
+                parent_context,
             ),
         )
         memory_id = int(cur.lastrowid)
+        # Index the compact child fact only (parent stays out of FTS to avoid noise).
         fact = self.fact_text(entity, attribute, value)
         self.conn.execute(
             "INSERT INTO memories_fts(rowid, fact) VALUES (?, ?)",
@@ -214,6 +234,7 @@ class MemoryDB:
         confidence: Optional[float] = None,
         embedding: Optional[Sequence[float] | np.ndarray] = None,
         is_permanent: Optional[bool] = None,
+        parent_context: Optional[str] = None,
         bump_created_at: bool = True,
     ) -> None:
         """Merge into an existing memory (used by Jaro-Winkler dedup)."""
@@ -231,6 +252,12 @@ class MemoryDB:
             else int(row["is_permanent"])
         )
         created_at = _utc_now_iso() if bump_created_at else row["created_at"]
+        if parent_context is not None:
+            new_parent = parent_context
+        elif "parent_context" in row.keys():
+            new_parent = row["parent_context"]
+        else:
+            new_parent = None
 
         emb_blob = row["embedding"]
         if embedding is not None:
@@ -244,7 +271,7 @@ class MemoryDB:
             UPDATE memories_meta
             SET entity = ?, attribute = ?, value = ?, confidence = ?,
                 created_at = ?, is_permanent = ?, embedding = ?,
-                invalidated_at = NULL
+                parent_context = ?, invalidated_at = NULL
             WHERE id = ?
             """,
             (
@@ -255,6 +282,7 @@ class MemoryDB:
                 created_at,
                 new_perm,
                 emb_blob,
+                new_parent,
                 memory_id,
             ),
         )

@@ -4,17 +4,18 @@
 PRAGMA journal_mode = WAL;
 PRAGMA foreign_keys = ON;
 
--- Metadata for each memory fact
+-- Metadata for each memory fact (child) + optional parent session snippet
 CREATE TABLE IF NOT EXISTS memories_meta (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     entity          TEXT    NOT NULL,
     attribute       TEXT    NOT NULL,
-    value           TEXT    NOT NULL,
+    value           TEXT    NOT NULL,           -- child fact (indexed in FTS/vec)
     confidence      REAL    NOT NULL DEFAULT 1.0,
     created_at      TEXT    NOT NULL,          -- ISO-8601 UTC
     invalidated_at  TEXT,                      -- NULL = active
     is_permanent    INTEGER NOT NULL DEFAULT 0, -- 1 => λ = 0 (no decay)
-    embedding       BLOB                       -- fallback when sqlite-vec unavailable
+    embedding       BLOB,                      -- fallback when sqlite-vec unavailable
+    parent_context  TEXT                       -- parent session snippet for prompts
 );
 
 CREATE INDEX IF NOT EXISTS idx_memories_meta_entity

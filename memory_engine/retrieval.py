@@ -12,8 +12,8 @@ import numpy as np
 from memory_engine.db import MemoryDB
 from memory_engine.extraction import hashing_embed, get_local_embedder
 
-# Spec defaults
-RRF_K = 60
+# Spec defaults (k=15 sharpens top-rank weight vs classic k=60)
+RRF_K = 15
 DEFAULT_LAMBDA = 0.00001  # decay per hour; permanent prefs use λ = 0
 
 
@@ -43,6 +43,9 @@ def rrf_score(rank_vec: Optional[float], rank_bm25: Optional[float], k: int = RR
     """
     Reciprocal Rank Fusion over the two channels.
     Missing ranks contribute 0 (document not retrieved by that channel).
+
+    Lower k (15 vs 60) increases score gap between rank-1 and long-tail hits,
+    so noisy lower ranks contribute less to the fused ranking / prompt.
     """
     score = 0.0
     if rank_vec is not None:
@@ -66,6 +69,13 @@ class ScoredMemory:
     rrf: float
     decay: float
     final_score: float
+    parent_context: Optional[str] = None  # parent session snippet for prompts
+
+    def prompt_text(self) -> str:
+        """Context shown to the answer model (parent snippet preferred)."""
+        if self.parent_context and self.parent_context.strip():
+            return self.parent_context.strip()
+        return f"{self.entity}'s {self.attribute} is {self.value}"
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -81,7 +91,9 @@ class ScoredMemory:
             "rrf": self.rrf,
             "decay": self.decay,
             "final_score": self.final_score,
+            "parent_context": self.parent_context,
             "fact": f"{self.entity}'s {self.attribute} is {self.value}",
+            "prompt_text": self.prompt_text(),
         }
 
 
@@ -89,7 +101,10 @@ class HybridRetriever:
     """
     Parallel BM25 (FTS5) + vector KNN → RRF → exponential time-decay → top-K.
 
-    Final Score = (1/(60 + Rank_vec) + 1/(60 + Rank_bm25)) × e^{-λ (t_now − t_created)}
+    Final Score = (1/(15 + Rank_vec) + 1/(15 + Rank_bm25)) × e^{-λ (t_now − t_created)}
+
+    Child facts are indexed for retrieval; parent_context (session snippet) is
+    expanded into the answer prompt when present.
     """
 
     def __init__(
@@ -151,6 +166,7 @@ class HybridRetriever:
             decay = time_decay(hours_since(row["created_at"], now), lam)
             final = rrf * decay
 
+            parent = row["parent_context"] if "parent_context" in row.keys() else None
             scored.append(
                 ScoredMemory(
                     id=mid,
@@ -165,6 +181,7 @@ class HybridRetriever:
                     rrf=rrf,
                     decay=decay,
                     final_score=final,
+                    parent_context=parent,
                 )
             )
 

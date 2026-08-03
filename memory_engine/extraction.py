@@ -293,7 +293,7 @@ class LlamaCppBackend:
         self,
         model_path: str | Path,
         *,
-        n_ctx: int = 2048,
+        n_ctx: int = 8192,
         n_threads: Optional[int] = None,
         n_gpu_layers: int = 0,
         chat_format: Optional[str] = None,
@@ -628,14 +628,22 @@ class MemoryExtractor:
             raw = self.llm.complete(prompt, grammar=MEMORY_JSON_GBNF)
         return parse_facts(raw)
 
-    def ingest(self, conversation: str) -> list[dict[str, Any]]:
+    def ingest(
+        self,
+        conversation: str,
+        *,
+        parent_context: Optional[str] = None,
+    ) -> list[dict[str, Any]]:
         """
         Extract facts and write/merge them into the DB.
-        Returns a list of action records for observability.
+
+        Child facts are indexed for retrieval; `parent_context` (defaults to
+        the raw conversation snippet) is stored for prompt expansion.
         """
         facts = self.extract_from_text(conversation)
         existing = self.db.list_active_entities()
         actions: list[dict[str, Any]] = []
+        parent = parent_context if parent_context is not None else conversation
 
         for fact in facts:
             if not fact.entity or not fact.attribute:
@@ -659,6 +667,7 @@ class MemoryExtractor:
                         confidence=fact.confidence,
                         embedding=emb,
                         is_permanent=fact.is_permanent,
+                        parent_context=parent,
                     )
                     existing.append((new_id, canon_entity))
                     actions.append(
@@ -680,6 +689,7 @@ class MemoryExtractor:
                         confidence=fact.confidence,
                         embedding=emb,
                         is_permanent=fact.is_permanent,
+                        parent_context=parent,
                     )
                     actions.append(
                         {
@@ -701,6 +711,7 @@ class MemoryExtractor:
                     confidence=fact.confidence,
                     embedding=emb,
                     is_permanent=fact.is_permanent,
+                    parent_context=parent,
                 )
                 existing.append((new_id, fact.entity))
                 actions.append(
