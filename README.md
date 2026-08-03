@@ -22,54 +22,57 @@ Cortex-AI is designed to be:
 
 ## Core architecture
 
-### 1) Ingestion (memory extraction + dedup)
+```text
+USER INPUT
+  → RAW MEMORY STORE (immutable memory_store)
+  → ENTITY MENTION DETECTION (Local LLM + GBNF)
+  → ENTITY RESOLUTION (Alias + Jaro-Winkler + FTS + Embedding)
+  → FACT EXTRACTION + EVENT EXTRACTION
+  → KNOWLEDGE LAYER (Entity Graph / Fact / Event / State)
+  → State Transition Engine (conflict handling)
 
-`memory_engine/extraction.py`
+QUERY
+  → Intent Router (State → SQL | Fact → table | Event → hybrid)
+  → Context Builder
+  → Local LLM → Answer
+```
 
-- Extraction model: local GGUF via `LlamaCppBackend` (`llama-cpp-python`)
-- Structured output: `MEMORY_JSON_GBNF` enforces JSON schema:
-  - `entity`, `attribute`, `value`, `confidence`, `is_permanent`
-- Dedup: Jaro-Winkler entity merge with threshold `0.88`
-- Embeddings: `LocalEmbedder` (`fastembed`, default `BAAI/bge-small-en-v1.5`)
+Entry point: `CortexEngine` in `memory_engine/cortex.py`.
 
-### 2) Storage
+### Write path
 
-`schema.sql`, `memory_engine/db.py`
+1. **Raw memory** — append-only `memory_store` (`id`, `text`, `timestamp`)
+2. **Mentions** — `mentions.py` GBNF array of `{mention, type}`
+3. **Resolve** — `resolve.py` blends exact/alias → JW (>0.88) → FTS → embedding → create
+4. **Facts / events** — `extractors.py` SPO triples + life events (GBNF)
+5. **State** — `state_engine.py` invalidates superseded stateful predicates (`studied_at`, `lives_in`, …)
 
-- `memories_meta`: source of truth
-  - child fact fields (`entity`, `attribute`, `value`)
-  - `created_at`, `is_permanent`, optional `parent_context`
-- `memories_fts` (`FTS5`): lexical search (BM25)
-- `memories_vec` (`sqlite-vec`, optional): vector KNN
-- graceful fallback to numpy cosine over BLOB embeddings if `sqlite-vec` unavailable
+### Query path
 
-### 3) Retrieval + ranking
+`query.py`: intent cues route to states / facts / events / raw memories, then answer head.
 
-`memory_engine/retrieval.py`
+### Legacy Phase-1 path
 
-Final score:
-
-\[
-\text{Final Score} = \left(\frac{1}{15 + \text{Rank}_{vec}} + \frac{1}{15 + \text{Rank}_{bm25}}\right) \times e^{-\lambda \Delta t}
-\]
-
-- `RRF_K = 15` (top-rank emphasis)
-- default decay `lambda = 1e-5` per hour
-- permanent memories use `lambda = 0`
-- parent-child expansion: retrieved child facts can surface `parent_context` session snippets in prompts
+`MemoryStack` + `HybridRetriever` (BM25 ∥ vector → RRF `k=15` × time-decay) remain for LoCoMo evals (`evals/run_locomo.py`).
 
 ## Repository layout
 
 ```text
 memory_engine/
-  __init__.py
-  db.py
-  extraction.py
-  retrieval.py
+  cortex.py        # CortexEngine (knowledge-layer pipeline)
+  knowledge_db.py  # memory_store / entities / facts / events / states
+  mentions.py      # mention detection (GBNF)
+  resolve.py       # entity resolution
+  extractors.py    # fact + event extraction
+  state_engine.py  # conflict handling → current state
+  query.py         # intent router + context + answer
   main.py          # REPL + one-shot CLI
+  db.py            # legacy MemoryDB (LoCoMo)
+  extraction.py    # LLM/embedder backends + legacy MemoryStack
+  retrieval.py     # legacy hybrid RRF retrieval
 
 evals/
-  run_locomo.py    # LoCoMo benchmark harness
+  run_locomo.py
 
 schema.sql
 requirements.txt
@@ -119,12 +122,14 @@ curl -L -o Llama-3.2-1B-Instruct-Q4_K_M.gguf \
 
 ```bash
 .venv/bin/python -m memory_engine.main
+# offline heuristics (no GGUF load):
+.venv/bin/python -m memory_engine.main --mock
 ```
 
 Commands:
-- `remember <text>`
-- `ask <query>`
-- `list`
+- `remember <text>` — raw → mentions → resolve → facts/events → state
+- `ask <query>` — intent → context → answer
+- `list` — dump states / facts / events / raw memories
 - `quit`
 
 Bare text is treated as `remember`.
@@ -132,16 +137,29 @@ Bare text is treated as `remember`.
 ### One-shot
 
 ```bash
-.venv/bin/python -m memory_engine.main remember "My name is Bryan. I live in Ann Arbor."
-.venv/bin/python -m memory_engine.main ask "Where does Bryan live?"
+.venv/bin/python -m memory_engine.main remember \
+  "I used to study at NTU in Taiwan. In 2026 I transferred to the University of Michigan."
+.venv/bin/python -m memory_engine.main ask "Where do I study now?"
 .venv/bin/python -m memory_engine.main list
 ```
 
 ### Scripted demo
 
 ```bash
-.venv/bin/python -m memory_engine.main --demo
+.venv/bin/python -m memory_engine.main --demo --mock   # heuristics
+.venv/bin/python -m memory_engine.main --demo          # real GGUF
 ```
+
+### Layered unit tests
+
+```bash
+.venv/bin/python -m unittest tests.test_layers -v
+```
+
+- **Layer 1a** — entity merge: `PyTorch` / `py-torch` / `Pytorch` same; `AppleInc` ≠ `apple`
+- **Layer 1b** — fact extraction emits `(subject, predicate, object)`
+- **Layer 1c** — state transitions for `lives_in`, `works_at`, `studies_at`, `relationship_status`
+- **Layer 2** — 2024 Chicago → 2025 Boston → 2026 Miami; ask “Where do I live now?”
 
 ## LoCoMo benchmark
 
