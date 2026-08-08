@@ -59,23 +59,23 @@ Entry point: `CortexEngine` in `memory_engine/cortex.py`.
 
 ```text
 memory_engine/
-  cortex.py        # CortexEngine (knowledge-layer pipeline)
+  cortex.py        # CortexEngine (remember + retrieve)
   knowledge_db.py  # memory_store / entities / facts / events / states
-  mentions.py      # mention detection (GBNF)
-  resolve.py       # entity resolution
+  mentions.py      # mention detection (GBNF + generic fallback)
+  resolve.py       # entity resolution (injectable gazetteer)
+  gazetteer.py     # optional alias-group loader
   extractors.py    # fact + event extraction
   state_engine.py  # conflict handling → current state
-  query.py         # intent router + context + answer
+  query.py         # intent router + context builder
   main.py          # REPL + one-shot CLI
-  db.py            # legacy MemoryDB (LoCoMo)
-  extraction.py    # LLM/embedder backends + legacy MemoryStack
-  retrieval.py     # legacy hybrid RRF retrieval
+  db.py / retrieval.py / extraction.py  # legacy LoCoMo path
 
+mcp_server/        # stdio MCP tools for any host model
+tests/
+  fixtures/        # scenario aliases + mention patterns (not prod)
+  support.py       # make_test_engine()
 evals/
   run_locomo.py
-
-schema.sql
-requirements.txt
 ```
 
 ## Requirements
@@ -161,6 +161,75 @@ Bare text is treated as `remember`.
 - **Layer 1c** — state transitions for `lives_in`, `works_at`, `studies_at`, `relationship_status`
 - **Layer 2** — 2024 Chicago → 2025 Boston → 2026 Miami; ask “Where do I live now?”
 
+### 11-turn life-story scenario
+
+```bash
+.venv/bin/python -m unittest tests.test_scenario_11 -v
+```
+
+Covers grew_up_in → NTU → major → interests → PyTorch → Foxconn internship →
+move to Ann Arbor → transfer to UMich (+ UMich alias) → Let Him Cook founded → SwiftUI/FastAPI.
+
+Scenario-specific alias groups and mention regexes live in `tests/fixtures/`
+(not in production `memory_engine/`). Tests wire them via `tests.support.make_test_engine`.
+
+## MCP server (any model searches memory)
+
+Cortex exposes tools over stdio MCP. The **host model** answers; Cortex only stores/retrieves.
+
+```bash
+# Use the project venv (macOS system `python` is often missing — use this):
+.venv/bin/python -m mcp_server --mock --db ./cortex.db
+```
+
+Tools: `memory_remember`, `memory_retrieve`, `memory_get_state`, `memory_search_facts`,
+`memory_search_events`, `memory_search_memories`, `memory_resolve_entity`, `memory_get`,
+`memory_summary`.
+
+Cursor `mcp.json` snippet:
+
+```json
+{
+  "mcpServers": {
+    "cortex-memory": {
+      "command": "/ABS/PATH/SQLitememo/.venv/bin/python",
+      "args": ["-m", "mcp_server", "--mock"],
+      "env": { "CORTEX_DB": "/ABS/PATH/SQLitememo/cortex.db" }
+    }
+  }
+}
+```
+
+Prefer `memory_retrieve` / `memory_get_state` over any local answer head.
+
+### Unified benchmark CLI (Ingest → Search → Evaluate)
+
+Use the project venv (`python` alone often fails on macOS):
+
+```bash
+# Full LoCoMo (10 conversations, gpt-4o answer + judge)
+.venv/bin/python run_benchmark.py \
+  --benchmark locomo \
+  --project-name memloom-eval-locomo \
+  --answerer-model gpt-4o \
+  --judge-model gpt-4o \
+  --provider openai
+
+# LongMemEval (downloads dataset on first run; --mock if no local GGUF)
+.venv/bin/python run_benchmark.py \
+  --benchmark longmemeval \
+  --project-name memloom-eval-longmem \
+  --answerer-model gpt-4o \
+  --judge-model gpt-4o \
+  --provider openai \
+  --max-questions 20 --mock
+```
+
+Requires `OPENAI_API_KEY`. Cortex handles ingest/search; OpenAI handles answer + judge.
+Run one benchmark at a time — parallel gpt-4o runs hit org TPM limits (~30k).
+
+Note: `memory-benchmarks/run_benchmark.py` is a Mem0-suite dispatcher (needs Mem0 cloud/OSS). Prefer the root `run_benchmark.py` for Cortex.
+
 ## LoCoMo benchmark
 
 LoCoMo repo is expected at `./locomo` with data at `locomo/data/locomo10.json`.
@@ -201,18 +270,54 @@ export OPENAI_API_KEY="<your-key>"
   --out results/locomo_gpt4o_mini_opt.json
 ```
 
-## Current benchmark snapshot (conv-26, 30 QA, balanced, cats 1/2/4)
+## LoCoMo results (full, Aug 2026)
+
+Setup: hybrid retrieval (BM25 ∥ vector → RRF × time-decay), **no** GBNF `--extract`, answerer + judge **gpt-4o**, `top_k=10`.  
+Artifacts: `results/memloom-eval-locomo_locomo.json`, `results/memloom-eval-locomo_locomo_judged.json`.
+
+### Cortex scores (1986 QA)
+
+| Metric | Score |
+|---|---:|
+| Overall token F1 | **0.605** |
+| LLM judge (gpt-4o) | **0.543** (1079 / 1986) |
+
+| Category | n | F1 |
+|---|---:|---:|
+| adversarial | 446 | 0.821 |
+| single_hop | 841 | 0.682 |
+| temporal | 321 | 0.460 |
+| multi_hop | 282 | 0.326 |
+| open_domain | 96 | 0.246 |
+
+### Compared to other memory software
+
+Published LoCoMo tables usually report **LLM-judge %** on categories 1–4 (often excluding adversarial). Numbers below are from the Mem0 paper / Memobase writeups and vendor corrections — treat as **directional**, not a controlled bake-off (prompts, judge, and category inclusion differ).
+
+| System | Overall (LLM judge, approx.) |
+|---|---:|
+| Full conversation in context | ~73% |
+| Memobase / Zep (claimed) | ~75% |
+| Mem0 Graph | ~68% |
+| Mem0 | ~67% |
+| LangMem | ~58% |
+| **Cortex (this run)** | **~54%** |
+| OpenAI memory baseline | ~53% |
+
+On **token F1**, Memobase’s own published artifact reported overall F1 ≈ **0.51** (with LLM ≈ 0.76); Cortex F1 **0.61** is stronger on overlap while the judge is stricter / lower.
+
+**Reading the gap**
+- Cortex is competitive as **local hybrid RAG** (strong adversarial / solid single-hop).
+- Behind graph-memory stacks on **multi-hop** and **temporal** (Mem0 temporal bar often cited ~55%).
+- Closing the gap means better cross-session evidence (knowledge layer / extraction), not only a stronger answer model — gpt-4o is already used here.
+
+### Earlier A/B smoke (conv-26, 30 QA, cats 1/2/4)
 
 | Answer model | Overall F1 | Temporal | Single-hop | Multi-hop |
 |---|---:|---:|---:|---:|
 | Llama-3.2-1B | 0.308 | 0.282 | 0.386 | 0.256 |
 | Qwen2.5-7B | 0.393 | 0.249 | 0.540 | 0.392 |
 | gpt-4o-mini (same retrieval) | 0.494 | 0.527 | 0.601 | 0.355 |
-
-Interpretation:
-- Temporal is close to the ~0.555 reference band when using a strong answer model.
-- Single-hop is solid with BM25 support.
-- Multi-hop still needs better cross-session evidence retrieval / synthesis.
 
 ## Notes
 
